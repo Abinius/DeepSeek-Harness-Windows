@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>DeepSeek Harness</title>
+  <style>
+    html, body {
+      margin: 0; height: 100%;
+      background: radial-gradient(1200px 600px at 50% -10%, #1b2a4a 0%, #0b0e14 55%, #080a0f 100%);
+      color: #e6eaf2;
+      font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+      -webkit-user-select: none; user-select: none;
+    }
+    .wrap { height: 100%; display: flex; flex-direction: column;
+            align-items: center; justify-content: center; gap: 18px; }
+    .logo { font-size: 30px; font-weight: 700; letter-spacing: 1px;
+            background: linear-gradient(90deg, #7aa2ff, #56d4a5);
+            -webkit-background-clip: text; background-clip: text; color: transparent; }
+    .spinner { width: 34px; height: 34px; border-radius: 50%;
+               border: 3px solid rgba(122,162,255,.2);
+               border-top-color: #7aa2ff; animation: spin 1s linear infinite; }
+    .hint { font-size: 13px; color: #8a94a8; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="logo">DeepSeek Harness</div>
+    <div class="spinner"></div>
+    <div class="hint">正在启动本地服务…</div>
+  </div>
+</body>
+</html>

@@ -1,0 +1,13 @@
+# dependencies & caches
+node_modules/
+.npm-cache/
+.electron-cache/
+*.log
+
+# build output (delivered via GitHub Releases, not committed)
+dist/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
