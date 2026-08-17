@@ -1,6 +1,6 @@
 {
   "name": "dsh-desktop",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "DeepSeek Harness — Windows desktop app",
   "main": "main.js",
   "author": "DeepSeek Harness",
@@ -22,7 +22,8 @@
     "files": [
       "main.js",
       "preload.js",
-      "splash.html"
+      "splash.html",
+      "build/icon.ico"
     ],
     "win": {
       "target": [

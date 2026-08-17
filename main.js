@@ -6,9 +6,13 @@
 //     wait until the URL answers, then load it in the window.
 //   * The server started by us is stopped when the last window closes; a
 //     pre-existing server is left untouched.
+//   * Feishu channel: the server is started with FEISHU_APP_ID/SECRET injected
+//     (persisted user env wins, built-in fallback otherwise), so the
+//     harness-lark plugin connects automatically. A tray menu shows the
+//     channel status and offers a one-click start/restart.
 
-const { app, BrowserWindow, dialog, shell } = require('electron');
-const { spawn } = require('node:child_process');
+const { app, BrowserWindow, dialog, shell, Tray, Menu, nativeImage } = require('electron');
+const { spawn, execFile } = require('node:child_process');
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -18,6 +22,10 @@ const path = require('node:path');
 const DEFAULT_HOST = '127.0.0.1';
 const DEFAULT_PORT = 3080;
 const URL = () => `http://${DEFAULT_HOST}:${DEFAULT_PORT}`;
+
+// Feishu channel credentials are read from the environment only.
+// Configure them as user-level env vars (e.g. `setx FEISHU_APP_ID ...` and
+// `setx FEISHU_APP_SECRET ...`) — do not commit secrets to the repository.
 
 // Candidates for locating the `dsh` CLI. `DSH_DESKTOP_DSH` wins if set.
 function dshCandidates() {
@@ -87,6 +95,61 @@ async function waitForServer(url, timeoutMs = 120000) {
   return false;
 }
 
+// ---- Feishu channel status ----------------------------------------------
+//
+// The channel is "connected" when the process listening on :3080 holds an
+// established TLS connection whose certificate covers *.feishu.cn. We find
+// the listener PID and handshake the peer with SNI to read its cert.
+
+let feishuStatus = 'unknown'; // unknown | starting | connected | disconnected
+
+function listenerPid() {
+  return new Promise((resolve) => {
+    execFile('netstat', ['-ano'], (err, stdout) => {
+      if (err) return resolve(null);
+      const line = stdout.split(/\r?\n/).find(
+        (l) => l.includes(`:${DEFAULT_PORT}`) && l.includes('LISTENING')
+      );
+      if (!line) return resolve(null);
+      const m = line.trim().split(/\s+/).pop();
+      resolve(/^\d+$/.test(m) ? Number(m) : null);
+    });
+  });
+}
+
+function checkFeishuConnection() {
+  return new Promise((resolve) => {
+    listenerPid().then((pid) => {
+      if (!pid) { feishuStatus = 'disconnected'; return resolve(false); }
+      // List established connections owned by the server PID, TLS-handshake
+      // each external peer, and accept any cert matching *.feishu.cn / lark.
+      execFile(
+        'powershell.exe',
+        ['-NoProfile', '-Command', `
+          $conns = Get-NetTCPConnection -OwningProcess ${pid} -ErrorAction SilentlyContinue |
+            Where-Object { $_.State -eq 'Established' -and $_.RemoteAddress -notlike '127.*' -and $_.RemoteAddress -ne '::1' }
+          foreach ($c in $conns) {
+            try {
+              $tcp = New-Object System.Net.Sockets.TcpClient
+              $tcp.Connect($c.RemoteAddress, $c.RemotePort)
+              $ssl = New-Object System.Net.Security.SslStream($tcp.GetStream(), $false, ([System.Net.Security.RemoteCertificateValidationCallback]{ $true }))
+              $ssl.AuthenticateAsClient('open.feishu.cn')
+              $subj = $ssl.RemoteCertificate.Subject
+              $ssl.Dispose(); $tcp.Close()
+              if ($subj -match 'feishu|larksuite|larkoffice') { Write-Output 'FEISHU_CONNECTED'; break }
+            } catch { }
+          }
+        `],
+        { windowsHide: true, timeout: 15000 },
+        (_err, stdout) => {
+          feishuStatus = stdout.includes('FEISHU_CONNECTED') ? 'connected' : 'disconnected';
+          resolve(feishuStatus === 'connected');
+        }
+      );
+    });
+  });
+}
+
 // ---- server child process -----------------------------------------------
 
 let serverChild = null;
@@ -126,6 +189,10 @@ async function startServer() {
       env: {
         ...process.env,
         DSH_HOME: process.env.DSH_HOME || path.join(process.env.USERPROFILE || '', '.dsh'),
+        // Feishu channel: pass through the user's credentials (no fallback —
+        // secrets live in the environment, never in this file).
+        FEISHU_APP_ID: process.env.FEISHU_APP_ID || '',
+        FEISHU_APP_SECRET: process.env.FEISHU_APP_SECRET || '',
       },
     });
 
@@ -135,6 +202,8 @@ async function startServer() {
       if (!serverStartedByUs) return;
       serverStartedByUs = false;
       serverChild = null;
+      feishuStatus = 'disconnected';
+      refreshTray();
       resolve(false);
     });
 
@@ -142,6 +211,14 @@ async function startServer() {
     serverStartedByUs = true;
     setTimeout(async () => {
       const ok = await waitForServer(URL(), 90000);
+      if (ok) {
+        feishuStatus = 'starting';
+        refreshTray();
+        // Give the lark gateway a few seconds to open its WebSocket, then probe.
+        setTimeout(() => {
+          checkFeishuConnection().then(() => refreshTray());
+        }, 8000);
+      }
       resolve(ok);
     }, 500);
   });
@@ -193,8 +270,118 @@ function createMainWindow() {
     return { action: 'deny' };
   });
 
+  // Closing the window hides to tray instead of quitting, so the server and
+  // the Feishu channel keep running. Use the tray "Exit" to fully quit.
+  mainWindow.on('close', (e) => {
+    if (!app.isQuitting) {
+      e.preventDefault();
+      mainWindow.hide();
+    }
+  });
   mainWindow.on('closed', () => { mainWindow = null; });
   return mainWindow;
+}
+
+// ---- tray ---------------------------------------------------------------
+
+let tray = null;
+
+function createTray() {
+  const iconPath = path.join(__dirname, 'build', 'icon.ico');
+  const icon = nativeImage.createFromPath(iconPath);
+  tray = new Tray(icon.isEmpty() ? nativeImage.createEmpty() : icon);
+  tray.setToolTip('DeepSeek Harness');
+  refreshTray();
+  tray.on('click', () => {
+    if (mainWindow) { mainWindow.show(); mainWindow.focus(); }
+  });
+}
+
+function refreshTray() {
+  if (!tray) return;
+  const labels = {
+    unknown: '未知',
+    starting: '启动中…',
+    connected: '已连接',
+    disconnected: '未连接',
+  };
+  const menu = Menu.buildFromTemplate([
+    {
+      label: `飞书通道：${labels[feishuStatus] || feishuStatus}`,
+      enabled: false,
+    },
+    { type: 'separator' },
+    {
+      label: '一键启动飞书通道',
+      click: async () => {
+        tray.setToolTip('DeepSeek Harness — 正在启动飞书通道…');
+        feishuStatus = 'starting';
+        refreshTray();
+        // Ensure the server is up first.
+        let ok = await probe(URL());
+        if (!ok) {
+          ok = await startServer();
+        } else if (!serverStartedByUs) {
+          // Server pre-exists: probe its channel; if not connected, we cannot
+          // force-restart a foreign server, so prompt the user.
+          const connected = await checkFeishuConnection();
+          if (connected) {
+            dialog.showMessageBox({
+              type: 'info',
+              title: '飞书通道',
+              message: '飞书通道已连接',
+              detail: '当前 DeepSeek Harness 服务已建立到飞书的连接。',
+            });
+            refreshTray();
+            return;
+          }
+          dialog.showMessageBox({
+            type: 'warning',
+            title: '飞书通道',
+            message: '服务已存在但飞书通道未连接',
+            detail:
+              '当前 3080 服务不是本应用启动的，无法自动重启。\n\n' +
+              '请关闭现有服务后，用本应用的「一键启动飞书通道」重新启动。',
+          });
+          refreshTray();
+          return;
+        }
+        if (!ok) {
+          dialog.showErrorBox('飞书通道', '无法启动 DeepSeek Harness 服务。');
+          feishuStatus = 'disconnected';
+          refreshTray();
+          return;
+        }
+        // Server (re)started by us with Feishu env injected: wait then probe.
+        feishuStatus = 'starting';
+        refreshTray();
+        setTimeout(async () => {
+          const connected = await checkFeishuConnection();
+          refreshTray();
+          dialog.showMessageBox({
+            type: connected ? 'info' : 'warning',
+            title: '飞书通道',
+            message: connected ? '飞书通道已连接 🎉' : '飞书通道未检测到连接',
+            detail: connected
+              ? '服务已建立到飞书的连接，去飞书私聊机器人试试吧。'
+              : '未检测到到飞书( *.feishu.cn )的连接。请检查：\n' +
+                '1. 飞书后台「事件订阅」是否使用长连接并订阅 im.message.receive_v1\n' +
+                '2. 应用是否已发布版本',
+          });
+        }, 10000);
+      },
+    },
+    { type: 'separator' },
+    { label: '打开主窗口', click: () => { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } } },
+    {
+      label: '退出',
+      click: () => {
+        app.isQuitting = true;
+        app.quit();
+      },
+    },
+  ]);
+  tray.setContextMenu(menu);
 }
 
 // ---- app lifecycle ------------------------------------------------------
@@ -207,12 +394,14 @@ if (!gotLock) {
   app.on('second-instance', () => {
     if (mainWindow) {
       if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.show();
       mainWindow.focus();
     }
   });
 
   app.whenReady().then(async () => {
     app.setAppUserModelId('ai.deepseek.harness.desktop');
+    createTray();
     createSplash();
 
     let ok = await probe(URL());
@@ -220,6 +409,9 @@ if (!gotLock) {
     if (!ok) {
       serverStartedByUs = await startServer();
       ok = serverStartedByUs;
+    } else {
+      // Server pre-exists: probe its Feishu channel state in the background.
+      setTimeout(() => { checkFeishuConnection().then(() => refreshTray()); }, 3000);
     }
 
     if (!ok) {
@@ -237,11 +429,10 @@ if (!gotLock) {
 
   // Shut down the server we started when the app fully quits.
   app.on('before-quit', () => {
+    app.isQuitting = true;
     stopServer();
   });
   app.on('window-all-closed', () => {
-    if (process.platform !== 'darwin') {
-      app.quit();
-    }
+    // Keep running in the tray (server + Feishu channel stay alive).
   });
 }
